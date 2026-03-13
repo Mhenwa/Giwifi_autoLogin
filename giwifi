@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+
+start() {
+    (
+        sleep 15
+        cd /mnt/giwifi
+        ./giwifi_new.sh your_account your_pwd http://10.100.100.2 > giwifi_log.txt 2>&1
+    ) &
+}

@@ -1,226 +1,186 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
-# Usage:  <username> <password> [baseurl]
-cd $(
-    cd "$(dirname "$0")"
-    pwd
-)
+# 用法:
+#   sh giwifi.sh 账号 密码 [base_url]
+# 例子:
+#   sh giwifi.sh 12345678901 123456 http://10.100.100.2
 
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.5.1.4 Safari/537.36"
-baseUrl="http://10.53.1.3"
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+BASE_URL="${3:-http://10.100.100.2}"
+LOGIN_URL="$BASE_URL/gportal/web/login?has_reload=1"
+POST_URL="$BASE_URL/gportal/Web/loginAction"
 
-LOG_FILE="giwifi.log"
-# 1 为开 0为关 日志
-LOG_FLAG=1
+TMP_DIR="/tmp/giwifi.$$"
+COOKIE="$TMP_DIR/cookie.txt"
+HTML="$TMP_DIR/login.html"
+RAW="$TMP_DIR/raw.txt"
+PADDED="$TMP_DIR/padded.bin"
+RESP="$TMP_DIR/resp.txt"
 
-log() {
-    if [ $LOG_FLAG -eq 1 ]; then
-        local datetime=$(date +'%Y-%m-%d %H:%M:%S')
-        local script_name=$(basename "$0")
-        local message="$@"
-
-        echo "[$datetime] [$script_name] - $message" >>"$LOG_FILE"
-    fi
-
+cleanup() {
+    rm -rf "$TMP_DIR"
 }
+trap cleanup EXIT INT TERM
 
-# 可选参数处理
-if [ "$#" -eq 3 ]; then
-    baseUrl=$3
-    log "use baseurl:$baseUrl"
-fi
+mkdir -p "$TMP_DIR" || exit 1
 
-first_page=$baseUrl'/gportal/web/login'
-post_url=$baseUrl'/gportal/web/authLogin?round='${RANDOM::3}
-state_url=$baseUrl'/gportal/web/queryAuthState'
-logout_url=$baseUrl'/gportal/web/authLogout'
-test_url="http://nettest.gwifi.com.cn"
-
-mywget() {
-    log "wget" "$@" "-U" "$UA"
-    resp_file=$(mktemp)
-    if wget "$@" -qO $resp_file -U "$UA" --header "Origin:"$baseUrl --timeout 2 --tries 2; then
-        # 请求成功，返回响应体
-        cat $resp_file
-    else
-        # 请求失败，输出错误信息到日志
-        log "wget error" $(cat $resp_file)
-    fi
-    rm $resp_file
-}
-
-urlencode() {
-    local string="$1"
-    local strlen=${#string}
-    local encoded=""
-    local pos c o
-
-    for ((pos = 0; pos < strlen; pos++)); do
-        c=${string:$pos:1}
-        case "$c" in
-        [-_.~a-zA-Z0-9]) o="${c}" ;;
-        *)
-            printf -v o '%%%02x' "'$c"
-            o=$(echo $o | tr 'a-z' 'A-Z') # 小写字母转大写
-            ;;
-        esac
-        encoded+="${o}"
-    done
-    echo "${encoded}"
-}
-urldecode() {
-    # 将%替换为ASCII码\x，并使用printf进行解码
-    printf '%b' "$(echo $1 | sed 's/+/ /g; s/%\(..\)/\\x\1/g;')"
-}
-
-# aes-128-cbc 加密 $1 data $2 key $3 iv 均为字符串 加密后base64编码
-# 依赖外部 openssl命令行工具
-aes_128_cbc() {
-    # 将第一个参数转换成16进制字符串
-    str2hex() {
-        # echo -n $1 | xxd -p
-        echo -n $1 | hexdump -v -e '/1 "%02x"'
-    }
-
-    # 将第一个参数16进制字符串转换成字符串
-    hex2str() {
-        # echo -n $1 | xxd -r -p
-        printf "%b" "$(echo -e $1 | sed 's/.\{2\}/\\x&/g')"
-    }
-
-    # 将第一个参数16进制字符串进行0填充
-    zeropadding() {
-        hex=$1
-        # printf '\x00' 空字符到文件，cat 或openssl -in 读取文件加密也可
-        blocksize=16
-        padlen=$((($blocksize - ${#hex} / 2 % $blocksize) % $blocksize))
-        for ((i = 1; i <= padlen; i++)); do
-            hex+='00'
-        done
-        echo $hex
-    }
-
-    # key
-    hex_key=$(str2hex $2)
-
-    # IV
-    hex_iv=$(str2hex $3)
-
-    # 要加密的数据
-    hex_data=$(str2hex $1)
-
-    # zeropadding
-    hex_data_padding=$(zeropadding $hex_data)
-
-    # 最后-A表示结果不自动添加换行
-    hex2str $hex_data_padding | openssl enc -aes-128-cbc -e -K $hex_key -iv $hex_iv -nopad -base64 -A
-}
-
-# 请求登录页面
-get() {
-    mywget $first_page
-}
-
-# 从$1拿到param $1 为html文本 $2 form的id
-get_form_input_from_page() {
-
-    # 形如 xxx=yyy 的字符'='两边urlencode
-    line_urlencode() {
-        params_urlencode() {
-            echo $(urlencode $1)"="$(urlencode $2)
-        }
-        while read line; do
-            new_line=$(echo $line |
-                awk -F '=' '{
-                print $1 " " $2
-                }')
-            echo $(params_urlencode $new_line)
-        done
-    }
-
-    # 从htmln拿到表单，然后拿到所有input name value 并序列化
-    echo $1 | grep -o '<form id=\"'$2'\"[^>]*>.*</form>' | sed 's/<\/form>.*//' |                       # 拿到第一个form标签内文本
-        grep -o '<input[^>]*>' | grep -o 'name=\".*\" \([\w]*\(=\".*\"\)\? \)*value\(=\"[^\"]*\"\)\?' | # 拿到所有inout标签
-        sed 's/ .* / /g' | sed 's/name=\"\([^"]*\)\" value\(=\"\([^\"]*\)\"\)\?/\1=\3/g' |              # 拿到带name value属性的input 并以name=value形式返回
-        line_urlencode |                                                                                # 每行urlencode
-        awk '{printf("%s&", $0)}' | sed 's/&$//' |                                                      # &连接并去除最后一个&
-        sed 's/\(\&name=\)\(\&password=\)//g'                                                           # 去掉最后的name及password
-}
-
-# $1 json文本 $2 字段
-json_get() {
-    echo $1 | sed -n 's/.*\"'$2'\":[ ]*\([0-9]*\)[^},]*[,}].*/\1/p'
-}
-
-# $1 param
-post() {
-    iv=$(echo $1 | grep -o 'iv=[^\&]*' | sed 's/iv=//g')
-    data=$(aes_128_cbc $1 "1234567887654321" $iv)
-    msg="data="$(urlencode $data)"&iv=$iv"
-    result=$(mywget $post_url --post-data $msg --header "Content-Type:application/x-www-form-urlencoded; charset=UTF-8" --header "Referer:$first_page")
-    json_get "$result" "status"
-}
-
-# $1 param
-queryAuthState() {
-    sign=$(echo $1 | grep -o 'sign=[^\&]*' | sed 's/sign=//g')
-    result=$(mywget $state_url --post-data "sign=$sign" --header "Content-Type:application/x-www-form-urlencoded; charset=UTF-8")
-    json_get "$result" "status"
-}
-
-checkAccessInternet() {
-    result=$(mywget $test_url)
-    # json_get $result 'resultCode'
-    if [ -n "$internetCheck" ]; then
-        # online
-        echo 1
-    else
-        echo 0
-    fi
-}
-
-# $1 html文本
-logout() {
-    data=$(get_form_input_from_page "$1" "frmLogout")
-    result=$(mywget $logout_url --post-data "$data" --header "Content-Type:application/x-www-form-urlencoded; charset=UTF-8")
-    json_get "$result" "status"
-}
-
-# $1 username $2 password
-login() {
-
-    html=$(get)
-    if [ -z "$html" ]; then
-        log "get nothing"
-        exit 1
-    fi
-    myparam=$(get_form_input_from_page "$html" "frmLogin")
-    if [ -z "myparam" ]; then
-        log "parse error"
-        exit 1
-    fi
-    myparam=$myparam"&name=""$(urlencode $1)""&password=""$(urlencode $2)"
-
-    authState=$(queryAuthState)
-    if [ $authState -eq 1 ]; then
-        # online
-        log "already online"
-        logoutBack=$(logout "$html")
-        if [ $logoutBack -eq 1 ]; then
-            log "logout success"
-        fi
-    fi
-    echo $(post $myparam)
-}
-
-## 从这里开始主执行顺序
-# 检查参数数量
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <username> <password> [baseurl]"
+if [ $# -lt 2 ]; then
+    echo "Usage: sh $0 <user_account> <user_password> [base_url]" >&2
     exit 1
 fi
 
-# 获取必填参数
-username=$1
-password=$2
-login $username $password
+USER_ACCOUNT="$1"
+USER_PASSWORD="$2"
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "missing command: $1" >&2
+        exit 1
+    }
+}
+
+need_cmd wget
+need_cmd sed
+need_cmd grep
+need_cmd openssl
+need_cmd hexdump
+need_cmd awk
+need_cmd tr
+
+log() {
+    echo "[giwifi] $*"
+}
+
+get_input_value() {
+    name="$1"
+    sed -n "s/.*name=\"$name\" value=\"\\([^\"]*\\)\".*/\\1/p" "$HTML" | head -n 1
+}
+
+urlencode() {
+    local s="$1"
+    local out=""
+    local c
+    while [ -n "$s" ]; do
+        c="$(printf '%s' "$s" | cut -c1)"
+        s="$(printf '%s' "$s" | cut -c2-)"
+        case "$c" in
+            [a-zA-Z0-9.~_-])
+                out="${out}${c}"
+                ;;
+            ' ')
+                out="${out}%20"
+                ;;
+            *)
+                hex="$(printf '%s' "$c" | hexdump -ve '1/1 "%.2x"')"
+                while [ -n "$hex" ]; do
+                    out="${out}%$(printf '%s' "$hex" | cut -c1-2)"
+                    hex="$(printf '%s' "$hex" | cut -c3-)"
+                done
+                ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+zeropad_file_16() {
+    infile="$1"
+    outfile="$2"
+    size="$(wc -c < "$infile" | tr -d ' ')"
+    rem=$((size % 16))
+    cp "$infile" "$outfile"
+    if [ "$rem" -ne 0 ]; then
+        pad=$((16 - rem))
+        i=0
+        while [ "$i" -lt "$pad" ]; do
+            printf '\000' >> "$outfile"
+            i=$((i + 1))
+        done
+    fi
+}
+
+fetch_page() {
+    log "fetch login page: $LOGIN_URL"
+    wget -q -O "$HTML" \
+        --save-cookies "$COOKIE" \
+        --keep-session-cookies \
+        --header="User-Agent: $UA" \
+        "$LOGIN_URL"
+}
+
+build_form() {
+    sign="$(get_input_value sign)"
+    sta_vlan="$(get_input_value sta_vlan)"
+    sta_port="$(get_input_value sta_port)"
+    sta_ip="$(get_input_value sta_ip)"
+    nas_ip="$(get_input_value nas_ip)"
+    nas_name="$(get_input_value nas_name)"
+    last_url="$(get_input_value last_url)"
+    request_ip="$(get_input_value request_ip)"
+    device_mode="$(get_input_value device_mode)"
+    device_type="$(get_input_value device_type)"
+    device_os_type="$(get_input_value device_os_type)"
+    is_mobile="$(get_input_value is_mobile)"
+    iv="$(get_input_value iv)"
+    login_type="$(get_input_value login_type)"
+    account_type="$(get_input_value account_type)"
+
+    [ -n "$sign" ] || { echo "failed to parse sign" >&2; exit 1; }
+    [ -n "$iv" ] || { echo "failed to parse iv" >&2; exit 1; }
+    [ "${#iv}" -eq 16 ] || { echo "bad iv length: ${#iv}" >&2; exit 1; }
+
+    body="sign=$(urlencode "$sign")"
+    body="$body&sta_vlan=$(urlencode "$sta_vlan")"
+    body="$body&sta_port=$(urlencode "$sta_port")"
+    body="$body&sta_ip=$(urlencode "$sta_ip")"
+    body="$body&nas_ip=$(urlencode "$nas_ip")"
+    body="$body&nas_name=$(urlencode "$nas_name")"
+    body="$body&last_url=$(urlencode "$last_url")"
+    body="$body&request_ip=$(urlencode "$request_ip")"
+    body="$body&device_mode=$(urlencode "$device_mode")"
+    body="$body&device_type=$(urlencode "$device_type")"
+    body="$body&device_os_type=$(urlencode "$device_os_type")"
+    body="$body&is_mobile=$(urlencode "$is_mobile")"
+    body="$body&iv=$(urlencode "$iv")"
+    body="$body&login_type=$(urlencode "$login_type")"
+    body="$body&account_type=$(urlencode "$account_type")"
+    body="$body&user_account=$(urlencode "$USER_ACCOUNT")"
+    body="$body&user_password=$(urlencode "$USER_PASSWORD")"
+
+    printf '%s' "$body" > "$RAW"
+    printf '%s' "$iv" > "$TMP_DIR/iv.txt"
+}
+
+encrypt_body() {
+    iv_ascii="$(cat "$TMP_DIR/iv.txt")"
+    iv_hex="$(printf '%s' "$iv_ascii" | hexdump -ve '1/1 "%.2x"')"
+    key_hex="$(printf '%s' '1234567887654321' | hexdump -ve '1/1 "%.2x"')"
+
+    zeropad_file_16 "$RAW" "$PADDED"
+
+    openssl enc -aes-128-cbc -K "$key_hex" -iv "$iv_hex" -nopad -base64 -A \
+        -in "$PADDED"
+}
+
+do_login() {
+    iv="$(cat "$TMP_DIR/iv.txt")"
+    enc="$(encrypt_body)"
+
+    log "post login action: $POST_URL"
+    wget -q -O "$RESP" \
+        --load-cookies "$COOKIE" \
+        --keep-session-cookies \
+        --header="User-Agent: $UA" \
+        --header="X-Requested-With: XMLHttpRequest" \
+        --header="Origin: $BASE_URL" \
+        --header="Referer: $LOGIN_URL" \
+        --header="Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
+        --post-data="data=$(urlencode "$enc")&iv=$(urlencode "$iv")" \
+        "$POST_URL"
+
+    cat "$RESP"
+    echo
+}
+
+fetch_page
+build_form
+do_login
